@@ -132,11 +132,33 @@ class NXDOMAIN(dns.exception.DNSException):
 class YXDOMAIN(dns.exception.DNSException):
     """The DNS query name is too long after DNAME substitution."""
 
-# The definition of the Timeout exception has moved from here to the
-# dns.exception module.  We keep dns.resolver.Timeout defined for
-# backwards compatibility.
 
-Timeout = dns.exception.Timeout
+def _errors_to_text(errors):
+    """Turn a resolution errors trace into a list of text."""
+    texts = []
+    for err in errors:
+        texts.append('Server {} {} port {} answered {}'.format(err[0],
+                     'TCP' if err[1] else 'UDP', err[2], err[3]))
+    return texts
+
+
+class LifetimeTimeout(dns.exception.Timeout):
+    """The resolution lifetime expired."""
+
+    msg = "The resolution lifetime expired."
+    fmt = "%s after {timeout} seconds: {errors}" % msg[:-1]
+    supp_kwargs = {'timeout', 'errors'}
+
+    def _fmt_kwargs(self, **kwargs):
+        srv_msgs = _errors_to_text(kwargs['errors'])
+        return super()._fmt_kwargs(timeout=kwargs['timeout'],
+                                   errors='; '.join(srv_msgs))
+
+
+# We added more detail to resolution timeouts, but they are still
+# subclasses of dns.exception.Timeout for backwards compatibility.  We also
+# keep dns.resolver.Timeout defined for backwards compatibility.
+Timeout = LifetimeTimeout
 
 
 class NoAnswer(dns.exception.DNSException):
@@ -147,6 +169,9 @@ class NoAnswer(dns.exception.DNSException):
 
     def _fmt_kwargs(self, **kwargs):
         return super()._fmt_kwargs(query=kwargs['response'].question)
+
+    def response(self):
+        return self.kwargs['response']
 
 
 class NoNameservers(dns.exception.DNSException):
@@ -163,11 +188,7 @@ class NoNameservers(dns.exception.DNSException):
     supp_kwargs = {'request', 'errors'}
 
     def _fmt_kwargs(self, **kwargs):
-        srv_msgs = []
-        for err in kwargs['errors']:
-            # pylint: disable=bad-continuation
-            srv_msgs.append('Server {} {} port {} answered {}'.format(err[0],
-                            'TCP' if err[1] else 'UDP', err[2], err[3]))
+        srv_msgs = _errors_to_text(kwargs['errors'])
         return super()._fmt_kwargs(query=kwargs['request'].question,
                                    errors='; '.join(srv_msgs))
 
@@ -984,21 +1005,23 @@ class BaseResolver:
         except Exception:  # pragma: no cover
             return False
 
-    def _compute_timeout(self, start, lifetime=None):
+    def _compute_timeout(self, start, lifetime=None, errors=None):
         lifetime = self.lifetime if lifetime is None else lifetime
         now = time.time()
         duration = now - start
+        if errors is None:
+            errors = []
         if duration < 0:
             if duration < -1:
                 # Time going backwards is bad.  Just give up.
-                raise Timeout(timeout=duration)
+                raise LifetimeTimeout(timeout=duration, errors=errors)
             else:
                 # Time went backwards, but only a little.  This can
                 # happen, e.g. under vmware with older linux kernels.
                 # Pretend it didn't happen.
                 now = start
         if duration >= lifetime:
-            raise Timeout(timeout=duration)
+            raise LifetimeTimeout(timeout=duration, errors=errors)
         return min(lifetime - duration, self.timeout)
 
     def _get_qnames_to_try(self, qname, search):
@@ -1141,7 +1164,7 @@ class Resolver(BaseResolver):
         which causes the value of the resolver's
         ``use_search_by_default`` attribute to be used.
 
-        Raises ``dns.exception.Timeout`` if no answers could be found
+        Raises ``dns.resolver.LifetimeTimeout`` if no answers could be found
         in the specified lifetime.
 
         Raises ``dns.resolver.NXDOMAIN`` if the query name does not exist.
@@ -1177,7 +1200,8 @@ class Resolver(BaseResolver):
                 (nameserver, port, tcp, backoff) = resolution.next_nameserver()
                 if backoff:
                     time.sleep(backoff)
-                timeout = self._compute_timeout(start, lifetime)
+                timeout = self._compute_timeout(start, lifetime,
+                                                resolution.errors)
                 try:
                     if dns.inet.is_address(nameserver):
                         if tcp:
@@ -1347,7 +1371,8 @@ def canonical_name(name):
     return get_default_resolver().canonical_name(name)
 
 
-def zone_for_name(name, rdclass=dns.rdataclass.IN, tcp=False, resolver=None):
+def zone_for_name(name, rdclass=dns.rdataclass.IN, tcp=False, resolver=None,
+                  lifetime=None):
     """Find the name of the zone which contains the specified name.
 
     *name*, an absolute ``dns.name.Name`` or ``str``, the query name.
@@ -1357,11 +1382,18 @@ def zone_for_name(name, rdclass=dns.rdataclass.IN, tcp=False, resolver=None):
     *tcp*, a ``bool``.  If ``True``, use TCP to make the query.
 
     *resolver*, a ``dns.resolver.Resolver`` or ``None``, the resolver to use.
-    If ``None``, the default resolver is used.
+    If ``None``, the default, then the default resolver is used.
+
+    *lifetime*, a ``float``, the total time to allow for the queries needed
+    to determine the zone.  If ``None``, the default, then only the individual
+    query limits of the resolver apply.
 
     Raises ``dns.resolver.NoRootSOA`` if there is no SOA RR at the DNS
     root.  (This is only likely to happen if you're using non-default
     root servers in your network and they are misconfigured.)
+
+    Raises ``dns.resolver.LifetimeTimeout`` if the answer could not be
+    found in the alotted lifetime.
 
     Returns a ``dns.name.Name``.
     """
@@ -1372,14 +1404,44 @@ def zone_for_name(name, rdclass=dns.rdataclass.IN, tcp=False, resolver=None):
         resolver = get_default_resolver()
     if not name.is_absolute():
         raise NotAbsolute(name)
+    start = time.time()
+    if lifetime is not None:
+        expiration = start + lifetime
+    else:
+        expiration = None
     while 1:
         try:
-            answer = resolver.resolve(name, dns.rdatatype.SOA, rdclass, tcp)
+            if expiration:
+                rlifetime = expiration - time.time()
+                if rlifetime <= 0:
+                    rlifetime = 0
+            else:
+                rlifetime = None
+            answer = resolver.resolve(name, dns.rdatatype.SOA, rdclass, tcp,
+                                      lifetime=rlifetime)
             if answer.rrset.name == name:
                 return name
             # otherwise we were CNAMEd or DNAMEd and need to look higher
-        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
-            pass
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer) as e:
+            if isinstance(e, dns.resolver.NXDOMAIN):
+                response = e.responses().get(name)
+            else:
+                response = e.response()
+            if response:
+                for rrs in response.authority:
+                    if rrs.rdtype == dns.rdatatype.SOA and \
+                       rrs.rdclass == rdclass:
+                       (nr, _, _) = rrs.name.fullcompare(name)
+                       if nr == dns.name.NAMERELN_SUPERDOMAIN:
+                           # We're doing a proper superdomain check as
+                           # if the name were equal we ought to have gotten
+                           # it in the answer section!  We are ignoring the
+                           # possibility that the authority is insane and
+                           # is including multiple SOA RRs for different
+                           # authorities.
+                           return rrs.name
+            # we couldn't extract anything useful from the response (e.g. it's
+            # a type 3 NXDOMAIN)
         try:
             name = name.parent()
         except dns.name.NoParent:

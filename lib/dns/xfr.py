@@ -125,8 +125,6 @@ class Inbound:
                 elif dns.serial.Serial(self.soa_rdataset[0].serial) < \
                      self.serial:
                     # It went backwards!
-                    print(dns.serial.Serial(self.soa_rdataset[0].serial),
-                          self.serial)
                     raise SerialWentBackwards
                 else:
                     if self.is_udp and len(message.answer[answer_index:]) == 0:
@@ -283,13 +281,33 @@ def make_query(txn_manager, serial=0,
         rdtype = dns.rdatatype.IXFR
     else:
         raise ValueError('serial out-of-range')
-    q = dns.message.make_query(zone_origin, rdtype, txn_manager.get_class(),
+    rdclass = txn_manager.get_class()
+    q = dns.message.make_query(zone_origin, rdtype, rdclass,
                                use_edns, False, ednsflags, payload,
                                request_payload, options)
     if serial is not None:
-        rrset = dns.rrset.from_text(zone_origin, 0, 'IN', 'SOA',
-                                    f'. . {serial} 0 0 0 0')
-        q.authority.append(rrset)
+        rdata = dns.rdata.from_text(rdclass, 'SOA', f'. . {serial} 0 0 0 0')
+        rrset = q.find_rrset(q.authority, zone_origin, rdclass,
+                             dns.rdatatype.SOA, create=True)
+        rrset.add(rdata, 0)
     if keyring is not None:
         q.use_tsig(keyring, keyname, algorithm=keyalgorithm)
     return (q, serial)
+
+def extract_serial_from_query(query):
+    """Extract the SOA serial number from query if it is an IXFR and return
+    it, otherwise return None.
+
+    *query* is a dns.message.QueryMessage that is an IXFR or AXFR request.
+
+    Raises if the query is not an IXFR or AXFR, or if an IXFR doesn't have
+    an appropriate SOA RRset in the authority section."""
+
+    question = query.question[0]
+    if question.rdtype == dns.rdatatype.AXFR:
+        return None
+    elif question.rdtype != dns.rdatatype.IXFR:
+        raise ValueError("query is not an AXFR or IXFR")
+    soa = query.find_rrset(query.authority, question.name, question.rdclass,
+                           dns.rdatatype.SOA)
+    return soa[0].serial

@@ -1036,6 +1036,8 @@ def inbound_xfr(where, txn_manager, query=None,
     """
     if query is None:
         (query, serial) = dns.xfr.make_query(txn_manager)
+    else:
+        serial = dns.xfr.extract_serial_from_query(query)
     rdtype = query.question[0].rdtype
     is_ixfr = rdtype == dns.rdatatype.IXFR
     origin = txn_manager.from_wire_origin()
